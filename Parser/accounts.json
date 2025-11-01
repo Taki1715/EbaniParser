@@ -1,0 +1,13 @@
+{
+  "accounts": [
+    {
+      "id": "default",
+      "phone": "79016397903",
+      "session_file": "parser_session",
+      "notify_chat_id": "",
+      "status": true,
+      "username": ""
+    }
+  ],
+  "current_id": "default"
+}
