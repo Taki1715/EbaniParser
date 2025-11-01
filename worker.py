@@ -6,6 +6,22 @@ Worker - парсер сообщений на Telethon.
 import asyncio
 import logging
 import re
+import html
+import inspect
+from collections import namedtuple
+from typing import Optional as _OptionalStr
+import os
+from accounts import AccountStore
+
+# Совместимость с Python 3.11+: в стандартной библиотеке удалён inspect.getargspec,
+# а pymorphy2 всё ещё его использует. Добавляем полифилл поверх inspect.
+if not hasattr(inspect, 'getargspec'):
+    def _getargspec_compat(func):
+        fs = inspect.getfullargspec(func)
+        ArgSpec = namedtuple('ArgSpec', 'args varargs keywords defaults')
+        return ArgSpec(fs.args, fs.varargs, fs.varkw, fs.defaults)
+    inspect.getargspec = _getargspec_compat  # type: ignore[attr-defined]
+
 from typing import List, Optional
 
 from telethon import TelegramClient, events
@@ -29,6 +45,59 @@ db = Database(config.DATABASE_PATH)
 class MessageFilter:
     """Класс для фильтрации сообщений по ключевым словам и стоп-словам."""
     
+    # Буквенные правила без морфологии
+    VERB_BASE_SUFFIXES = ("ть", "ти")  # инфинитив
+    ADJ_BASE_SUFFIXES = ("ый", "ий", "ой")
+    ADJ_ALLOWED_ENDINGS = ("ый", "ая", "ое", "ие", "ые", "ой", "ем", "ими", "его", "ею")
+    NOUN_ALLOWED_ENDINGS = ("а", "у", "ом", "е", "и", "ов", "ам", "ах", "ы")
+
+    # Частые приставки русских глаголов (для учёта производных форм)
+    VERB_PREFIXES = {
+        "по", "пере", "вы", "в", "за", "на", "с", "со", "под", "подо",
+        "над", "от", "ото", "об", "обо", "про", "при", "у", "до", "раз",
+        "рас", "воз", "вз", "из", "ис", "без", "через", "пере", "перео"
+    }
+
+    @staticmethod
+    def detect_pos_simple(keyword: str) -> str:
+        k = keyword.lower()
+        if any(k.endswith(suf) for suf in MessageFilter.VERB_BASE_SUFFIXES):
+            return "verb"
+        if any(k.endswith(suf) for suf in MessageFilter.ADJ_BASE_SUFFIXES):
+            return "adj"
+        # Простая эвристика для наречий: окончание на "о" (и не попали в adj/verb)
+        if k.endswith("о"):
+            return "adv"
+        return "noun"
+
+    @staticmethod
+    def build_keyword_pattern(raw_keyword: str) -> re.Pattern:
+        """Построить регекс по буквальным правилам (без морфологии)."""
+        k = raw_keyword.strip()
+        pos = MessageFilter.detect_pos_simple(k)
+        if pos == "verb":
+            # Разрешаем приставки, но запрещаем иные окончания/изменения
+            prefixes = "|".join(sorted(MessageFilter.VERB_PREFIXES, key=len, reverse=True))
+            prefix_group = f"(?:{prefixes})?" if prefixes else ""
+            pattern = rf"(?i)\b{prefix_group}{re.escape(k)}\b"
+            return re.compile(pattern)
+        if pos == "adj":
+            base = k
+            for suf in MessageFilter.ADJ_BASE_SUFFIXES:
+                if k.endswith(suf):
+                    base = k[: -len(suf)]
+                    break
+            endings = "|".join(MessageFilter.ADJ_ALLOWED_ENDINGS)
+            pattern = rf"(?i)\b{re.escape(base)}(?:{endings})\b"
+            return re.compile(pattern)
+        if pos == "adv":
+            pattern = rf"(?i)\b{re.escape(k)}\b"
+            return re.compile(pattern)
+        # Существительное по умолчанию
+        endings = "|".join(MessageFilter.NOUN_ALLOWED_ENDINGS)
+        pattern = rf"(?i)\b{re.escape(k)}(?:{endings})?\b"
+        return re.compile(pattern)
+
     @staticmethod
     def normalize_text(text: str) -> str:
         """
@@ -48,9 +117,9 @@ class MessageFilter:
         Проверить наличие ключевого слова в тексте.
         
         Поддерживает:
-        - _слово_ - поиск слова как отдельного
-        - слово1+слово2 - все слова должны присутствовать
-        - обычное слово - поиск подстроки
+        - _слово_ — строгое слово по границе (без окончаний)
+        - слово1+слово2 — все слова (каждое по границе с разрешенными окончаниями)
+        - обычное слово — по границе слова с простыми окончаниями
         
         Args:
             text: Текст для проверки
@@ -59,24 +128,28 @@ class MessageFilter:
         Returns:
             True если ключевое слово найдено
         """
-        text = MessageFilter.normalize_text(text)
         keyword = keyword.strip()
         
         # Проверка на комбинацию слов (слово1+слово2)
         if '+' in keyword:
-            words = [MessageFilter.normalize_text(w) for w in keyword.split('+')]
-            return all(word in text for word in words)
+            words = [w.strip() for w in keyword.split('+') if w.strip()]
+            if not words:
+                return False
+            return all(MessageFilter.check_keyword(text, w) for w in words)
         
         # Проверка на точное слово (_слово_)
         if keyword.startswith('_') and keyword.endswith('_'):
-            word = MessageFilter.normalize_text(keyword[1:-1])
-            # Поиск слова с границами
-            pattern = r'\b' + re.escape(word) + r'\b'
-            return bool(re.search(pattern, text, re.IGNORECASE))
+            word = keyword[1:-1].strip()
+            if not word:
+                return False
+            # Строгое слово без окончаний
+            return bool(re.search(rf"(?i)\b{re.escape(word)}\b", text))
         
-        # Обычный поиск подстроки
-        keyword_normalized = MessageFilter.normalize_text(keyword)
-        return keyword_normalized in text
+        # Буквальная проверка по регексу
+        if not keyword:
+            return False
+        pattern = MessageFilter.build_keyword_pattern(keyword)
+        return bool(pattern.search(text))
     
     @staticmethod
     def check_keywords(text: str, keywords: List[str]) -> bool:
@@ -124,11 +197,15 @@ class MessageFilter:
 class TelegramParser:
     """Класс для парсинга сообщений из Telegram."""
     
-    def __init__(self):
-        """Инициализация парсера."""
+    def __init__(self, session_name: _OptionalStr = None):
+        """Инициализация парсера.
+        Args:
+            session_name: имя файла сессии Telethon (без .session). Если None, берется из config/по умолчанию
+        """
         self.client: Optional[TelegramClient] = None
         self.bot_client: Optional[TelegramClient] = None
         self.me = None
+        self._session_name = session_name
     
     async def init_client(self):
         """Инициализировать Telegram клиент."""
@@ -142,15 +219,33 @@ class TelegramParser:
                 )
             else:
                 # Если нет session string, создаем обычную сессию
-                self.client = TelegramClient(
-                    'parser_session',
-                    config.API_ID,
-                    config.API_HASH
-                )
+                session_file = self._session_name or 'parser_session'
+                self.client = TelegramClient(session_file, config.API_ID, config.API_HASH)
             
             await self.client.start()
             self.me = await self.client.get_me()
             logger.info(f"Клиент подключен: {self.me.phone if self.me else 'Unknown'}")
+
+            # Обновим отображаемую подпись аккаунта из реальных данных
+            try:
+                if self._session_name:
+                    acc = AccountStore.find_by_session_file(self._session_name)
+                    if acc:
+                        display_phone = getattr(self.me, 'phone', None) or ''
+                        username = getattr(self.me, 'username', None) or ''
+                        title = username or display_phone or f"id:{getattr(self.me, 'id', '')}"
+                        AccountStore.update(acc.get('id'), phone=title)
+            except Exception as _:
+                pass
+            # Обновим подпись аккаунта в accounts.json (телефон/username)
+            try:
+                from accounts import AccountStore as _AS
+                phone = getattr(self.me, 'phone', None) or ''
+                username = getattr(self.me, 'username', None) or ''
+                if self._session_name:
+                    _AS.update_identity_by_session(self._session_name, phone=phone, username=username)
+            except Exception:
+                pass
             
             # Клиент-бот для отправки уведомлений
             if config.BOT_TOKEN:
@@ -278,6 +373,7 @@ class TelegramParser:
             chat_id = event.chat_id
             message_id = event.message.id
             text = event.message.text or "[медиа]"
+            safe_text = html.escape(text)
             
             # Создаем ссылку на сообщение
             if hasattr(chat, 'username') and chat.username:
@@ -293,6 +389,8 @@ class TelegramParser:
                 f"Сообщение переслано из чата: <b>{chat_title}</b>\n"
                 f"ID чата: <code>{chat_id}</code>\n"
                 f"<a href=\"{message_link}\">Ссылка на сообщение</a>\n\n"
+                "<b>Текст сообщения</b>\n"
+                f"{safe_text}"
             )
             
             # Отправляем уведомление
@@ -314,11 +412,7 @@ class TelegramParser:
                     link_preview=False
                 )
             
-            # Пересылаем оригинальное сообщение
-            await self.client.forward_messages(
-                notification_chat_id_int,
-                event.message
-            )
+            # Пересылка оригинального сообщения убрана, все сведения собраны в одном тексте
             
             # Сохраняем в историю
             db.add_log(
@@ -398,10 +492,12 @@ class TelegramParser:
         logger.info("Парсер остановлен")
 
 
-async def main():
-    """Главная функция."""
-    parser = TelegramParser()
-    
+async def main(session_name: str | None = None):
+    """Главная функция.
+    Args:
+        session_name: имя файла сессии Telethon для конкретного аккаунта
+    """
+    parser = TelegramParser(session_name=session_name)
     try:
         await parser.start()
     except KeyboardInterrupt:
@@ -414,7 +510,8 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        sess = os.environ.get("ACC_SESSION_NAME")
+        asyncio.run(main(sess))
     except KeyboardInterrupt:
         logger.info("Парсер остановлен пользователем")
 

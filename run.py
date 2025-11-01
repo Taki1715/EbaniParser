@@ -11,6 +11,7 @@ from multiprocessing import Process
 
 import bot
 import worker
+from accounts import AccountStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,15 +31,15 @@ def run_bot():
         logger.error(f"Ошибка в админ-панели: {e}")
 
 
-def run_worker():
-    """Запустить парсер."""
+def run_worker_for_account(session_name: str):
+    """Запустить парсер для конкретного аккаунта."""
     try:
-        logger.info("Запуск парсера...")
-        asyncio.run(worker.main())
+        logger.info(f"Запуск парсера для сессии: {session_name}")
+        asyncio.run(worker.main(session_name))
     except KeyboardInterrupt:
         logger.info("Парсер остановлен")
     except Exception as e:
-        logger.error(f"Ошибка в парсере: {e}")
+        logger.error(f"Ошибка в парсере {session_name}: {e}")
 
 
 def main():
@@ -49,15 +50,19 @@ def main():
     
     # Создаем процессы
     bot_process = Process(target=run_bot, name="AdminBot")
-    worker_process = Process(target=run_worker, name="Parser")
+    # Один процесс бота + N процессов парсеров по активным аккаунтам
+    active_accounts = AccountStore.active_accounts()
+    worker_processes = [Process(target=run_worker_for_account, args=(a.get("session_file") or 'parser_session',), name=f"Parser-{a.get('id')}") for a in active_accounts]
     
     # Обработчик сигнала завершения
     def signal_handler(sig, frame):
         logger.info("\n\nПолучен сигнал остановки. Завершение работы...")
         bot_process.terminate()
-        worker_process.terminate()
+        for p in worker_processes:
+            p.terminate()
         bot_process.join()
-        worker_process.join()
+        for p in worker_processes:
+            p.join()
         logger.info("Все процессы остановлены")
         sys.exit(0)
     
@@ -69,8 +74,12 @@ def main():
         logger.info("Запуск админ-панели...")
         bot_process.start()
         
-        logger.info("Запуск парсера...")
-        worker_process.start()
+        if not active_accounts:
+            logger.info("Активных аккаунтов нет. Откройте 'Мои аккаунты' в боте и включите нужные.")
+        else:
+            for p in worker_processes:
+                logger.info(f"Запуск парсера процесса: {p.name}")
+                p.start()
         
         logger.info("\n" + "="*50)
         logger.info("Все сервисы запущены!")
@@ -79,21 +88,26 @@ def main():
         
         # Ожидаем завершения процессов
         bot_process.join()
-        worker_process.join()
+        for p in worker_processes:
+            p.join()
         
     except KeyboardInterrupt:
         logger.info("\n\nОстановка всех сервисов...")
         bot_process.terminate()
-        worker_process.terminate()
+        for p in worker_processes:
+            p.terminate()
         bot_process.join()
-        worker_process.join()
+        for p in worker_processes:
+            p.join()
         logger.info("Все сервисы остановлены")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         bot_process.terminate()
-        worker_process.terminate()
+        for p in worker_processes:
+            p.terminate()
         bot_process.join()
-        worker_process.join()
+        for p in worker_processes:
+            p.join()
 
 
 if __name__ == "__main__":

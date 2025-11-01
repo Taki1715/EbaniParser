@@ -15,6 +15,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import config
 from database import Database
+from accounts import AccountStore
 
 # Настройка логирования
 logging.basicConfig(
@@ -45,6 +46,7 @@ class Form(StatesGroup):
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     """Главное меню."""
     keyboard = [
+        [InlineKeyboardButton(text="👤 Мои аккаунты", callback_data="accounts")],
         [InlineKeyboardButton(text="📊 Парсер / Лидогенератор", callback_data="parser_settings")],
         [InlineKeyboardButton(text="📜 История лидов", callback_data="lead_history")],
         [InlineKeyboardButton(text="📥 Импорт источников", callback_data="import_sources")],
@@ -225,6 +227,111 @@ def back_to_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+# ==================== АККАУНТЫ ====================
+
+def accounts_keyboard() -> InlineKeyboardMarkup:
+    accounts = AccountStore.list_accounts()
+    current_id = AccountStore.get_current_id()
+    keyboard = []
+    if not accounts:
+        keyboard.append([InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="acc_add")])
+        keyboard.append([InlineKeyboardButton(text="⬅ Назад", callback_data="main_menu")])
+        return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    for acc in accounts:
+        title = acc.get('phone') or acc.get('session_file') or acc.get('id')
+        is_current = " 🟦 (текущий)" if acc.get("id") == current_id else ""
+        label = f"Аккаунт: {title}{is_current}"
+        keyboard.append([InlineKeyboardButton(text=label, callback_data=f"acc_set_current:{acc.get('id')}")])
+    keyboard.append([InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="acc_add")])
+    keyboard.append([InlineKeyboardButton(text="⬅ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+@router.callback_query(F.data == "accounts")
+async def show_accounts(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    # Автодобавление дефолтной сессии, если аккаунтов нет
+    AccountStore.ensure_default_account()
+    current = AccountStore.get_current_account()
+    header = (
+        "👤 <b>МОИ АККАУНТЫ</b>\n\n"
+        f"Текущий: <code>{(current.get('phone') if current else None) or (current.get('session_file') if current else 'не выбран')}</code>\n\n"
+        "Выберите аккаунт для управления или добавьте новый."
+    )
+    await callback.message.edit_text(header, reply_markup=accounts_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+class AccForm(StatesGroup):
+    waiting_phone = State()
+    waiting_session = State()
+
+@router.callback_query(F.data == "acc_add")
+async def add_account_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AccForm.waiting_phone)
+    await callback.message.edit_text("Введите номер телефона аккаунта (в формате +7...):", reply_markup=back_to_main_keyboard())
+    await callback.answer()
+
+@router.message(StateFilter(AccForm.waiting_phone))
+async def add_account_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    await state.set_state(AccForm.waiting_session)
+    await message.answer("Введите имя session-файла Telethon (без .session), например: acc1", reply_markup=back_to_main_keyboard())
+
+@router.message(StateFilter(AccForm.waiting_session))
+async def add_account_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    phone = data.get("phone")
+    session_file = message.text.strip()
+    acc_id = session_file
+    try:
+        AccountStore.add_account(acc_id=acc_id, phone=phone, session_file=session_file)
+        await message.answer("✅ Аккаунт добавлен", reply_markup=accounts_keyboard())
+    except Exception as e:
+        await message.answer(f"❌ Не удалось добавить: {e}")
+    await state.clear()
+
+@router.callback_query(F.data.startswith("acc_toggle:"))
+async def acc_toggle(callback: CallbackQuery):
+    acc_id = callback.data.split(":",1)[1]
+    acc = AccountStore.get_account(acc_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+    AccountStore.update(acc_id, status=not acc.get("status"))
+    await callback.message.edit_reply_markup(reply_markup=accounts_keyboard())
+    await callback.answer("Готово")
+
+@router.callback_query(F.data.startswith("acc_del:"))
+async def acc_delete(callback: CallbackQuery):
+    acc_id = callback.data.split(":",1)[1]
+    AccountStore.remove_account(acc_id)
+    await callback.message.edit_reply_markup(reply_markup=accounts_keyboard())
+    await callback.answer("Удалено")
+
+@router.callback_query(F.data.startswith("acc_open:"))
+async def acc_open(callback: CallbackQuery):
+    # Упрощаем: нажатие по аккаунту сразу делает его текущим
+    acc_id = callback.data.split(":",1)[1]
+    AccountStore.set_current_id(acc_id)
+    await callback.message.edit_text(
+        "👤 <b>МОИ АККАУНТЫ</b>\n\nТекущий аккаунт обновлён.",
+        reply_markup=accounts_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer("Установлен текущим")
+
+@router.callback_query(F.data.startswith("acc_set_current:"))
+async def acc_set_current(callback: CallbackQuery):
+    acc_id = callback.data.split(":",1)[1]
+    AccountStore.set_current_id(acc_id)
+    await callback.message.edit_text(
+        "👤 <b>МОИ АККАУНТЫ</b>\n\nТекущий аккаунт обновлён.\n\nВыберите аккаунт для управления или добавьте новый.",
+        reply_markup=accounts_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer("Текущий аккаунт установлен")
+
+
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
 def get_parser_status_text() -> str:
@@ -233,10 +340,14 @@ def get_parser_status_text() -> str:
     keywords_count = len(db.get_keywords())
     stopwords_count = len(db.get_stopwords())
     notification_chat = conf.get('notification_chat_id', 'не установлен')
-    
-    # TODO: Получить номер телефона из Telethon (пока заглушка)
-    phone = "не подключен"
-    
+
+    AccountStore.ensure_default_account()
+    current = AccountStore.get_current_account()
+    if current:
+        phone = current.get('phone') or current.get('session_file') or 'выбран'
+    else:
+        phone = 'не выбран'
+
     text = (
         "⚙️ <b>НАСТРОЙКА ПАРСЕРА</b>\n\n"
         f"📱 Аккаунт: <code>{phone}</code>\n"
